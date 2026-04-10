@@ -4,7 +4,6 @@ const { Pool } = require("pg");
 const app = express();
 app.use(express.json());
 
-// PostgreSQL connection
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
@@ -41,7 +40,7 @@ async function initDB() {
 }
 initDB();
 
-// API endpoint (IMPORTANT)
+// API endpoint
 app.post("/receive", async (req, res) => {
   const type = req.query.type;
   const data = JSON.stringify(req.body);
@@ -76,7 +75,6 @@ app.post("/receive", async (req, res) => {
   }
 });
 
-// Start server
 app.listen(3000, () => {
-  console.log("Server running on port 3000");
+  console.log("Server running");
 });
