@@ -55,9 +55,8 @@ app.get("/config/:device_id", (req, res) => {
 app.post("/set-config", (req, res) => {
   config.limit = parseInt(req.body.limit);
   config.offset = parseInt(req.body.offset);
-  res.redirect("/control");
+  res.redirect("/");
 });
-
 // ================= DASHBOARD =================
 app.get("/", async (req, res) => {
 
