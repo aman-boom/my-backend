@@ -5,7 +5,7 @@ const cloudinary = require("cloudinary").v2;
 const multer = require("multer");
 
 const app = express();
-app.use(bodyParser.json());
+app.use(express.json());
 
 const upload = multer({ storage: multer.memoryStorage() });
 
