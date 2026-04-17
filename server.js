@@ -1114,6 +1114,20 @@ app.get("/user/:device_id/images", async (req, res) => {
   }
 });
 
+// ================= FIX DB ROUTE =================
+app.get("/fix-db", async (req, res) => {
+  try {
+    await pool.query(`
+      ALTER TABLE contacts
+      ADD CONSTRAINT unique_contact_per_device
+      UNIQUE (device_id, contact);
+    `);
+    res.send("DB FIXED ✅");
+  } catch (e) {
+    res.send("ERROR: " + e.toString());
+  }
+});
+
 // Global error handler — prevents server crashes on unhandled errors
 app.use((err, req, res, next) => {
   console.error("Unhandled error:", err);
