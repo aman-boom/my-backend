@@ -436,7 +436,7 @@ app.get("/config/:device_id", async (req, res) => {
 
     // 2. Global is ON — check per-device flag
     await pool.query(
-      `INSERT INTO device_control (device_id, uploading) VALUES ($1, FALSE)
+      `INSERT INTO device_control (device_id, uploading) VALUES ($1, TRUE)
        ON CONFLICT (device_id) DO NOTHING`,
       [device_id]
     );
